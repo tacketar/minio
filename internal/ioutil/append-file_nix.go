@@ -21,7 +21,6 @@
 package ioutil
 
 import (
-	"io"
 	"os"
 )
 
@@ -42,6 +41,6 @@ func AppendFile(dst string, src string, osync bool) error {
 		return err
 	}
 	defer srcFile.Close()
-	_, err = io.Copy(appendFile, srcFile)
+	_, err = Copy(appendFile, srcFile)
 	return err
 }

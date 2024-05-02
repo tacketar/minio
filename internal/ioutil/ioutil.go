@@ -26,13 +26,13 @@ import (
 	"os"
 	"sync"
 	"time"
-
+	"errors"
+	"fmt"
 	"github.com/minio/minio/internal/disk"
 )
 
 // WriteOnCloser implements io.WriteCloser and always
 // executes at least one write operation if it is closed.
-//
 // This can be useful within the context of HTTP. At least
 // one write operation must happen to send the HTTP headers
 // to the peer.
@@ -211,12 +211,103 @@ func NewSkipReader(r io.Reader, n int64) io.Reader {
 	return &SkipReader{r, n}
 }
 
+//** A normal LFS page is 6*16k=96k so the buffer is an integral number of pages
 var copyBufPool = sync.Pool{
 	New: func() interface{} {
-		b := make([]byte, 32*1024)
+		b := make([]byte, 4*960*1024)
 		return &b
 	},
 }
+
+//--------------------------------------------------------
+// ErrShortWrite means that a write accepted fewer bytes than requested
+// but failed to return an explicit error.
+var ErrShortWrite = errors.New("short write")
+
+// errInvalidWrite means that a write returned an impossible count.
+var errInvalidWrite = errors.New("invalid write result")
+
+// EOF is the error returned by Read when no more input is available.
+// (Read must return EOF itself, not an error wrapping EOF,
+// because callers will test for EOF using ==.)
+// Functions should return EOF only to signal a graceful end of input.
+// If the EOF occurs unexpectedly in a structured data stream,
+// the appropriate error is either [ErrUnexpectedEOF] or some other error
+// giving more detail.
+var EOF = errors.New("EOF")
+
+// copyBuffer is the actual implementation of Copy and CopyBuffer.
+// if buf is nil, one is allocated.  Our copyBuffer always reads a file buffer if possible before sending it on
+func mycopyBuffer(dst io.Writer, src io.Reader, buf []byte) (written int64, err error) {
+        var bsize int
+        var nleft int
+        var nr int
+        var got int
+        var er error
+
+        bsize = len(buf)
+        fmt.Print("COPY_START: buffer size =", bsize, "\n");
+
+        if buf == nil {
+                size := 32 * 1024
+                if l, ok := src.(*io.LimitedReader); ok && int64(size) > l.N {
+                        if l.N < 1 {
+                                size = 1
+                        } else {
+                                size = int(l.N)
+                        }
+                }
+                buf = make([]byte, size)
+        }
+
+        for {
+                //** Loop until the buffer is full
+                nr = 0
+                nleft = bsize
+                for (nleft > 0) {
+                    got, er = src.Read(buf[nr:])
+                    nleft = nleft - got
+                    nr = nr + got
+                    if er != nil {
+                        break
+                    }
+                }
+
+                //Old: nr, er := src.Read(buf)
+                if nr > 0 {
+                        nw, ew := dst.Write(buf[0:nr])
+                        if nw < 0 || nr < nw {
+                                nw = 0
+                                if ew == nil {
+                                        ew = errInvalidWrite
+                                }
+                        }
+                        written += int64(nw)
+                        fmt.Print("WRITE_END: written=", written, " ew=", ew, "\n");
+                        if ew != nil {
+                                err = ew
+                                break
+                        }
+                        if nr != nw {
+                                err = ErrShortWrite
+                                break
+                        }
+                }
+                if er != nil {
+                        if er != io.EOF {
+                                fmt.Print("COPY_ER: er=", er, " EOF=", io.EOF, " err==EOF=", (er == io.EOF), "\n");
+                                err = er
+                        } else {
+                            err = nil
+                        }
+                        break
+                }
+        }
+        fmt.Print("COPY_END: written=", written, " err=", err, " er=", er, "\n");
+        return written, err
+}
+
+//--------------------------------------------------------
 
 // Copy is exactly like io.Copy but with re-usable buffers.
 func Copy(dst io.Writer, src io.Reader) (written int64, err error) {
@@ -224,7 +315,7 @@ func Copy(dst io.Writer, src io.Reader) (written int64, err error) {
 	buf := *bufp
 	defer copyBufPool.Put(bufp)
 
-	return io.CopyBuffer(dst, src, buf)
+	return mycopyBuffer(dst, src, buf)
 }
 
 // SameFile returns if the files are same.
